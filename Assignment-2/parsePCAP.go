@@ -1,6 +1,22 @@
+/*
+* Script to parse PCAP file and output stats.
+*
+* Author: Ganesh Vernekar
+*
+* Prereq:
+* $ sudo apt-get install libpcap-dev
+* $ go get github.com/google/gopacket
+*
+* To run this script
+* 1. Change the file path in `func main()`.
+* 2. `go build parsePCAP.go`
+* 3. `./parsePCAP` (or `sudo ./parsePCAP` if file is protected).
+* The stats and the exported values for the graphs will be writte out in the same directory
+*                               (with prefix as the second argument in `pcapInfo` function).
+**/
+
 package main
 
-// https://github.com/google/gopacket/blob/master/examples/pcaplay/main.go
 import (
 	"encoding/csv"
 	"fmt"
@@ -61,14 +77,27 @@ func newResult(prefix string) *result {
 }
 
 func (res *result) updateAPs(packet gopacket.Packet) {
-	l := packet.Layer(layers.LayerTypeDot11InformationElement)
-	if l != nil {
-		pkt := l.(*layers.Dot11InformationElement)
-		if pkt.ID == 0 && len(pkt.Info) > 0 {
-			res.ssids[string(pkt.Info)] = struct{}{}
+	if l := packet.Layer(layers.LayerTypeDot11); l != nil {
+		pkt := l.(*layers.Dot11)
+
+		typesForSender := []gopacket.LayerType{layers.LayerTypeDot11MgmtAssociationResp, layers.LayerTypeDot11CtrlCTS,
+			layers.LayerTypeDot11MgmtReassociationResp, layers.LayerTypeDot11MgmtBeacon}
+		for _, t := range typesForSender {
+			if l := packet.Layer(t); l != nil {
+				res.ssids[pkt.Address2.String()] = struct{}{}
+				return
+			}
+		}
+
+		typesForReceiver := []gopacket.LayerType{layers.LayerTypeDot11MgmtAssociationReq, layers.LayerTypeDot11CtrlRTS,
+			layers.LayerTypeDot11MgmtReassociationReq}
+		for _, t := range typesForReceiver {
+			if l := packet.Layer(t); l != nil {
+				res.ssids[pkt.Address1.String()] = struct{}{}
+				return
+			}
 		}
 	}
-
 }
 
 func (res *result) updateTypeCounts(pkt *layers.Dot11) {
@@ -126,37 +155,42 @@ func (res *result) packetSizeExporter() {
 	writer2 := res.newTSVWriter("packetRatePlot.tsv")
 	res.write(writer2, []string{"Time (mins)", "Packets/sec"})
 
-	var startTS time.Time
+	var startTS, ts time.Time
 	interval := 1 * time.Minute
 
 	packetCount := 0
 	size := 0
-
 	mins := 0
+
+	dump := func() {
+		var avgSize float64
+		if packetCount != 0 {
+			avgSize = float64(size) / float64(packetCount)
+		}
+		mins++
+
+		res.write(writer, []string{strconv.Itoa(mins), fmt.Sprintf("%f", avgSize)})
+		res.write(writer2, []string{strconv.Itoa(mins), fmt.Sprintf("%f", float64(packetCount)/(float64(ts.Sub(startTS))/float64(time.Second)))})
+
+		startTS = startTS.Add(interval)
+		packetCount = 0
+		size = 0
+	}
+
 	for packet := range res.packetSizeChan {
-		ts := packet.Metadata().Timestamp
+		ts = packet.Metadata().Timestamp
 		if startTS.IsZero() {
 			startTS = ts
 		}
 		for ts.Sub(startTS) > interval {
-
-			var avgSize float64
-			if packetCount != 0 {
-				avgSize = float64(size) / float64(packetCount)
-			}
-			mins++
-
-			res.write(writer, []string{strconv.Itoa(mins), fmt.Sprintf("%f", avgSize)})
-			res.write(writer2, []string{strconv.Itoa(mins), fmt.Sprintf("%f", float64(packetCount)/float64(interval/time.Second))})
-
-			startTS = startTS.Add(interval)
-			packetCount = 0
-			size = 0
+			dump()
 		}
-
 		size += len(packet.Data())
 		res.packetSizeHistogram[len(packet.Data())]++
 		packetCount++
+	}
+	if packetCount > 0 {
+		dump()
 	}
 
 	histWriter := res.newTSVWriter("packetSizeHistogram.tsv")
@@ -183,11 +217,30 @@ func (res *result) radioLayerExporter() {
 	var startTS time.Time
 	interval := 1 * time.Minute
 
-	packetCount := 0
+	packetCount1 := 0
+	packetCount2 := 0
 	dataRate := uint32(0)
 	signalStrength := 0
-
 	mins := 0
+
+	dump := func() {
+		mins++
+		var rateAvg, strengthAvg float64
+		if packetCount1 != 0 {
+			rateAvg = float64(dataRate) / float64(packetCount1)
+		}
+		if packetCount2 != 0 {
+			strengthAvg = float64(signalStrength) / float64(packetCount2)
+		}
+		res.write(phyDataRateWriter, []string{strconv.Itoa(mins), fmt.Sprintf("%f", rateAvg)})
+		res.write(rssiDataRateWriter, []string{strconv.Itoa(mins), fmt.Sprintf("%f", strengthAvg)})
+
+		startTS = startTS.Add(interval)
+		packetCount1 = 0
+		packetCount2 = 0
+		dataRate = 0
+		signalStrength = 0
+	}
 	for packet := range res.radioLayerChan {
 		ts := packet.Metadata().Timestamp
 		if startTS.IsZero() {
@@ -198,30 +251,26 @@ func (res *result) radioLayerExporter() {
 			radio = l.(*layers.RadioTap)
 		}
 		for ts.Sub(startTS) > interval {
-
-			mins++
-			var rateAvg, strengthAvg float64
-			if packetCount != 0 {
-				rateAvg = float64(dataRate) / float64(packetCount)
-				strengthAvg = float64(signalStrength) / float64(packetCount)
-			}
-			res.write(phyDataRateWriter, []string{strconv.Itoa(mins), fmt.Sprintf("%f", rateAvg)})
-			res.write(rssiDataRateWriter, []string{strconv.Itoa(mins), fmt.Sprintf("%f", strengthAvg)})
-
-			startTS = startTS.Add(interval)
-			packetCount = 0
-			dataRate = 0
-			signalStrength = 0
+			dump()
 		}
 		if radio == nil {
 			continue
 		}
 
-		dataRate += uint32(radio.Rate)
-		signalStrength += int(radio.DBMAntennaSignal)
-		res.dataRateHistogram[uint8(radio.Rate)]++
-		packetCount++
+		if radio.Present.Rate() {
+			dataRate += uint32(radio.Rate)
+			res.dataRateHistogram[uint8(radio.Rate)]++
+			packetCount1++
+		}
+		if radio.Present.DBMAntennaSignal() {
+			signalStrength += int(radio.DBMAntennaSignal)
+			packetCount2++
+		}
 
+	}
+
+	if packetCount1 > 0 || packetCount2 > 0 {
+		dump()
 	}
 
 	histWriter := res.newTSVWriter("dataRateHistogram.tsv")
@@ -267,12 +316,10 @@ func (res *result) closeFiles() {
 }
 
 func pcapInfo(filename string, prefix string) {
-
 	res := newResult(prefix)
 
 	handleRead, err := pcap.OpenOffline(filename)
 	handleErr(err)
-
 	res.initPlotsExport()
 	packetSource := gopacket.NewPacketSource(handleRead, handleRead.LinkType())
 	for packet := range packetSource.Packets() {
@@ -286,8 +333,8 @@ func pcapInfo(filename string, prefix string) {
 		}
 		pkt := l.(*layers.Dot11)
 		res.updateTypeCounts(pkt)
+		res.updateProtected(pkt)
 	}
-
 	res.closePlotsExport()
 
 	stats := res.newTSVWriter("stats.tsv")
@@ -301,7 +348,6 @@ func pcapInfo(filename string, prefix string) {
 	res.write(stats, []string{})
 	res.write(stats, []string{})
 	res.write(stats, []string{})
-
 	res.write(stats, []string{"Types"})
 	for k, v := range res.typeCounts {
 		res.write(stats, []string{k.String(), strconv.Itoa(v)})
@@ -313,9 +359,9 @@ func pcapInfo(filename string, prefix string) {
 	}
 
 	res.closeFiles()
-
 }
 
 func main() {
-	pcapInfo("/home/codesome/Downloads/Capture1_Mess_150PM.pcapng", "mess")
+	pcapInfo("/home/codesome/CS15BTECH11018_IITH_802_11.pcapng", "mess")
+	pcapInfo("/home/codesome/Wireshark_802_11.pcap", "online")
 }
