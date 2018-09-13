@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 if [ "$#" -ne 4 ]; then
     echo "Usage: $0 <interface> <SSID> <password> <channel>"
     echo "Example: $0 wlp2s0 MyHotspot AwesomePwd 6"
