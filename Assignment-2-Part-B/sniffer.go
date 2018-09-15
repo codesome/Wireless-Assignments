@@ -49,53 +49,49 @@ func handleErr(err error) {
 	}
 }
 
+func createHotspot(intf, ssid, channel, password string) {
+	handleErr(exec.Command("nmcli", "dev", "wifi", "hotspot", "ifname", intf, "ssid", ssid, "band", "bg", "channel", channel, "password", password).Run())
+}
+
 func main() {
+
+	if len(os.Args) != 2 || (os.Args[1] != "hotspot" && os.Args[1] != "connect") {
+		fmt.Printf("Usage: %s hotspot|connect\n", os.Args[0])
+	}
+
+	hotspot := os.Args[1] == "hotspot"
 
 	s := NewSniffer("wlp2s0", "mon0", 30*time.Second)
 	s.SetInterruptHandler()
 
 	handleErr(s.StartSniffer())
 
+	var packetHandler PacketHandler
+	if hotspot {
+		packetHandler = s.StatsForHotspot()
+	} else {
+		packetHandler = s.StatsForConnection()
+	}
+
 	// channelsToTest := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 	channelsToTest := []int{6}
 	for _, i := range channelsToTest {
-		count := 0
-		beaconCount := 0
-		handleErr(s.Sniff(i, sniffDuration, func(packet gopacket.Packet) {
-			count++
-			for _, l := range packet.Layers() {
-				if l.LayerType() == layers.LayerTypeDot11InformationElement {
-					var radio *layers.RadioTap
-					if l := packet.Layer(layers.LayerTypeRadioTap); l != nil {
-						radio = l.(*layers.RadioTap)
-						if !radio.Present.Channel() || !radio.ChannelFlags.Ghz2() {
-							continue
-						}
-					} else {
-						continue
-					}
-					pkt := l.(*layers.Dot11InformationElement)
-					if pkt.ID == layers.Dot11InformationElementIDQBSSLoadElem {
-						if ut, ok := s.channelUtilization[freqChanMap[uint16(radio.ChannelFrequency)]]; ok {
-							ut.count++
-							ut.totalValue += int64(pkt.Info[2])
-						} else {
-							handleErr(fmt.Errorf("Frequency not found in channelUtilization map: %d", radio.ChannelFrequency))
-						}
-						// fmt.Println(int(pkt.Info[2]), radio.ChannelFrequency)
-						beaconCount++
-						break
-					}
-				}
-			}
-		}, handleErr))
-		fmt.Println(i, count, beaconCount)
+		handleErr(s.Sniff(i, sniffDuration, packetHandler, handleErr))
+		fmt.Println(i, s.count, s.beaconCount)
 	}
 
 	handleErr(s.StopSniffer())
-	fmt.Println(s.LeastUtilizedOrthogonalChan())
-
+	if hotspot {
+		c := s.LeastUtilizedOrthogonalChan()
+		fmt.Println("Selected Channel:", c)
+		// createHotspot(s.device, "CS15BTECH11018", strconv.Itoa(c), "secretpassword")
+	} else {
+		ssid := s.LeastStationCountSSID()
+		fmt.Println("Selected SSID:", ssid)
+	}
 }
+
+type PacketHandler func(packet gopacket.Packet) error
 
 type sniffer struct {
 	monitorStarted        bool
@@ -103,8 +99,15 @@ type sniffer struct {
 	mtx                   sync.Mutex
 	device, monitorDevice string
 	timeout               time.Duration
+	infoPacketCount       map[int]int64
 
 	channelUtilization map[int]*utilization
+	channelUniqueMacs  map[int]map[string]struct{}
+	ssidStationCount   map[string]*utilization
+
+	// temp
+	count       int
+	beaconCount int
 }
 
 type utilization struct {
@@ -119,9 +122,14 @@ func NewSniffer(device, monitorDevice string, timeout time.Duration) *sniffer {
 		monitorDevice:      monitorDevice,
 		timeout:            timeout,
 		channelUtilization: make(map[int]*utilization),
+		channelUniqueMacs:  make(map[int]map[string]struct{}),
+		infoPacketCount:    make(map[int]int64),
+		ssidStationCount:   make(map[string]*utilization),
 	}
 	for i := 0; i <= 11; i++ {
 		s.channelUtilization[i] = &utilization{}
+		s.channelUniqueMacs[i] = make(map[string]struct{})
+		s.infoPacketCount[i] = 0
 	}
 	return s
 }
@@ -195,7 +203,7 @@ func (s *sniffer) captureFilename(channel int) string {
 	return fmt.Sprintf("capture_chan%d.pcapng", channel)
 }
 
-func (s *sniffer) Sniff(channel int, sniffDur int, packetHandler func(packet gopacket.Packet), errorHandler func(err error)) error {
+func (s *sniffer) Sniff(channel int, sniffDur int, packetHandler PacketHandler, errorHandler func(err error)) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	if !s.monitorStarted {
@@ -223,15 +231,43 @@ func (s *sniffer) Sniff(channel int, sniffDur int, packetHandler func(packet gop
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
-		packetHandler(packet)
+		if err := packetHandler(packet); err != nil {
+			errorHandler(err)
+		}
 	}
 
 	return nil
 }
 
+func (s *sniffer) updateAPs(channel int, packet gopacket.Packet) {
+	if l := packet.Layer(layers.LayerTypeDot11); l != nil {
+		pkt := l.(*layers.Dot11)
+
+		typesForSender := []gopacket.LayerType{layers.LayerTypeDot11MgmtAssociationResp, layers.LayerTypeDot11CtrlCTS,
+			layers.LayerTypeDot11MgmtReassociationResp, layers.LayerTypeDot11MgmtBeacon}
+		for _, t := range typesForSender {
+			if l := packet.Layer(t); l != nil {
+				s.channelUniqueMacs[channel][pkt.Address2.String()] = struct{}{}
+				return
+			}
+		}
+
+		typesForReceiver := []gopacket.LayerType{layers.LayerTypeDot11MgmtAssociationReq, layers.LayerTypeDot11CtrlRTS,
+			layers.LayerTypeDot11MgmtReassociationReq}
+		for _, t := range typesForReceiver {
+			if l := packet.Layer(t); l != nil {
+				s.channelUniqueMacs[channel][pkt.Address1.String()] = struct{}{}
+				return
+			}
+		}
+	}
+}
+
 func (s *sniffer) LeastUtilizedOrthogonalChan() int {
+	notExistCount := 0
 	leastVal := math.MaxFloat64
 	leastUtilizedChan := 1
+	fmt.Println("\n\nCHANNEL UTILISATION")
 	for c, ut := range s.channelUtilization {
 		avg := float64(0)
 		if ut.count != 0 {
@@ -239,8 +275,149 @@ func (s *sniffer) LeastUtilizedOrthogonalChan() int {
 		}
 		fmt.Println(c, "#", ut.totalValue, "#", ut.count, "#", avg)
 		if (c == 1 || c == 6 || c == 11) && avg < leastVal {
+			if s.infoPacketCount[c] == 0 && ut.totalValue == 0 {
+				notExistCount++
+			}
 			leastUtilizedChan = c
 		}
 	}
+
+	if notExistCount > 1 {
+		leastUtilizedChan = 1
+		minc := len(s.channelUniqueMacs[1])
+		if len(s.channelUniqueMacs[6]) < minc {
+			leastUtilizedChan = 6
+		}
+		if len(s.channelUniqueMacs[11]) < minc {
+			leastUtilizedChan = 11
+		}
+	}
+
+	fmt.Println()
+	for k1, v := range s.channelUniqueMacs {
+		if len(v) == 0 {
+			continue
+		}
+		fmt.Println(k1)
+		for k2 := range v {
+			fmt.Println(k2)
+		}
+	}
+
 	return leastUtilizedChan
+}
+
+func (s *sniffer) LeastStationCountSSID() string {
+	selectedSSID := ""
+	leastCount := math.MaxFloat64
+	fmt.Println("\n\nSTATION COUNT")
+	for ssid, ut := range s.ssidStationCount {
+		avg := float64(ut.totalValue) / float64(ut.count)
+		if avg < leastCount {
+			leastCount = avg
+			selectedSSID = ssid
+		}
+		fmt.Println(ssid, "#", ut.totalValue, "#", ut.count, "#", avg)
+	}
+	return selectedSSID
+}
+
+func (s *sniffer) StatsForHotspot() PacketHandler {
+	return func(packet gopacket.Packet) error {
+		s.count++
+		for _, l := range packet.Layers() {
+			if l.LayerType() == layers.LayerTypeDot11InformationElement {
+				// Getting radio.
+				var radio *layers.RadioTap
+				if l := packet.Layer(layers.LayerTypeRadioTap); l != nil {
+					radio = l.(*layers.RadioTap)
+					if !radio.Present.Channel() || !radio.ChannelFlags.Ghz2() {
+						continue
+					}
+				} else {
+					continue
+				}
+
+				// Getting channel.
+				ch := freqChanMap[uint16(radio.ChannelFrequency)]
+				s.infoPacketCount[ch]++
+				s.updateAPs(ch, packet)
+
+				pkt := l.(*layers.Dot11InformationElement)
+				if pkt.ID == layers.Dot11InformationElementIDQBSSLoadElem {
+					if ut, ok := s.channelUtilization[ch]; ok {
+						ut.count++
+						ut.totalValue += int64(pkt.Info[2])
+					} else {
+						handleErr(fmt.Errorf("Frequency not found in channelUtilization map: %d", radio.ChannelFrequency))
+					}
+					s.beaconCount++
+					break
+				}
+			}
+		}
+
+		return nil
+	}
+}
+
+func (s *sniffer) getSSID(packet gopacket.Packet) string {
+	for _, l := range packet.Layers() {
+		if l.LayerType() == layers.LayerTypeDot11InformationElement {
+			pkt := l.(*layers.Dot11InformationElement)
+			if pkt.ID == layers.Dot11InformationElementIDSSID {
+				return string(pkt.Info)
+			}
+		}
+	}
+	return ""
+}
+
+func (s *sniffer) StatsForConnection() PacketHandler {
+
+	return func(packet gopacket.Packet) error {
+		s.count++
+		ssid := s.getSSID(packet)
+		if ssid == "" {
+			return nil
+		}
+		for _, l := range packet.Layers() {
+			if l.LayerType() == layers.LayerTypeDot11InformationElement {
+				// Getting radio.
+				var radio *layers.RadioTap
+				if l := packet.Layer(layers.LayerTypeRadioTap); l != nil {
+					radio = l.(*layers.RadioTap)
+					if !radio.Present.Channel() || !radio.ChannelFlags.Ghz2() {
+						continue
+					}
+				} else {
+					continue
+				}
+
+				// Getting channel.
+				ch := freqChanMap[uint16(radio.ChannelFrequency)]
+				s.infoPacketCount[ch]++
+				s.updateAPs(ch, packet)
+
+				pkt := l.(*layers.Dot11InformationElement)
+				if pkt.ID == layers.Dot11InformationElementIDQBSSLoadElem {
+
+					ut, ok := s.ssidStationCount[ssid]
+					if !ok {
+						ut = &utilization{}
+						s.ssidStationCount[ssid] = ut
+					}
+					ut.count++
+					val := int64(pkt.Info[1]) << 8
+					val += int64(pkt.Info[0])
+					ut.totalValue += val
+
+					s.beaconCount++
+					break
+				}
+			}
+		}
+
+		return nil
+	}
 }
