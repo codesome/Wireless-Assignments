@@ -3,3 +3,4 @@ parsePCAP
 *.tsv
 *.csv
 sniffer
+*.pcapng
