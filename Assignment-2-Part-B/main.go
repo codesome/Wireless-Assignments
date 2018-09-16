@@ -35,8 +35,7 @@ func createHotspot(intf, ssid, channel, password string) {
 
 func connectToSSID(device, ssid string) {
 	fmt.Printf("Connecting to %q...\n", ssid)
-	commands := []string{"con", "up", ssid}
-	handleErr(exec.Command("nmcli", commands...).Run())
+	handleErr(exec.Command("nmcli", "con", "up", ssid).Run())
 }
 
 func main() {
